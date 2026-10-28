@@ -117,15 +117,21 @@ struct Functions {
     // MCSP parameters
     static inline constexpr Real MCSP_storm_speed_pref     = 600e2;    // pressure level for winds in MCSP calculation Pa]
     static inline constexpr Real MCSP_conv_depth_min       = 700e2;    // pressure thickness of convective heating [Pa]
-    static inline constexpr Real MCSP_shear_min            = 3.0;      // min shear value for MCSP to be active
-    static inline constexpr Real MCSP_shear_max            = 200.0;    // max shear value for MCSP to be active
+    static inline constexpr Real MCSP_shear_gate_min       = 3.0;      // legacy min shear for MCSP to be active (use_shear_scaling_mcsp=false)
+    static inline constexpr Real MCSP_shear_gate_max       = 200.0;    // legacy max shear for MCSP to be active (use_shear_scaling_mcsp=false)
     static inline constexpr Real MCSP_t_coeff_default      = 0.3;      // default MCSP temperature coefficient
     static inline constexpr Real MCSP_q_coeff_default      = 0.0;      // default MCSP sp. humidity coefficient
     static inline constexpr Real MCSP_mom_coeff_default    = 0.0;      // default MCSP momentum coefficient (fraction of shear)
     static inline constexpr Real MCSP_mom_tau              = 3600.0;   // MCSP momentum tendency timescale [s]
+    // shear scaling parameters (trapezoid function of low-level shear magnitude [m/s])
+    static inline constexpr Real shear_min_default         = 4.0;      // below this the shear scaling is zero
+    static inline constexpr Real shear_optimal_min_default = 12.0;     // ramp-up ends, full strength begins
+    static inline constexpr Real shear_optimal_max_default = 30.0;     // full strength ends, ramp-down begins
+    static inline constexpr Real shear_max_default         = 55.0;     // above this the shear scaling is zero
     // Default values for ZmRuntimeOpt fields
     static inline constexpr Real alfa                      = 0.14;     // default downdraft proportionality factor
-    static inline constexpr Real ke                        = 2.5E-6;   // default evaporation efficiency
+    static inline constexpr Real evap_efficiency_min       = 2.5E-6;   // default evaporation efficiency for zero shear scaling
+    static inline constexpr Real evap_efficiency_max       = 2.5E-6;   // default evaporation efficiency for full shear scaling
     static inline constexpr Real dmpdz                     = -0.7e-3;  // default convective entrainment parameter [1/m]
     static inline constexpr Real tiedke_add                = 0.8;      // default Tiedke temperature perturbation addition [K]
     static inline constexpr Real c0                        = 0.0020;   // default autoconversion coefficient
@@ -153,7 +159,8 @@ struct Functions {
       upper_limit_pref    = params.get<Real>("upper_limit_pref",    40e2);
       tau                 = params.get<Real>("tau",                 3600);
       alfa                = params.get<Real>("alfa",                ZMC::alfa);
-      ke                  = params.get<Real>("ke",                  ZMC::ke);
+      evap_efficiency_min = params.get<Real>("evap_efficiency_min", ZMC::evap_efficiency_min);
+      evap_efficiency_max = params.get<Real>("evap_efficiency_max", ZMC::evap_efficiency_max);
       dmpdz               = params.get<Real>("dmpdz",               ZMC::dmpdz);
       tpert_fix           = params.get<bool>("tpert_fix",           true);
       tpert_fac           = params.get<Real>("tpert_fac",           2);
@@ -177,6 +184,22 @@ struct Functions {
       mcsp_q_coeff        = params.get<Real>("mcsp_q_coeff",        ZMC::MCSP_q_coeff_default);
       mcsp_mom_coeff      = params.get<Real>("mcsp_mom_coeff",      ZMC::MCSP_mom_coeff_default);
       mcsp_use_full_shear = params.get<bool>("mcsp_use_full_shear", false);
+      // shear scaling parameters
+      use_shear_scaling_mcsp = params.get<bool>("use_shear_scaling_mcsp", false);
+      use_shear_scaling_evap = params.get<bool>("use_shear_scaling_evap", false);
+      shear_min           = params.get<Real>("shear_min",           ZMC::shear_min_default);
+      shear_optimal_min   = params.get<Real>("shear_optimal_min",   ZMC::shear_optimal_min_default);
+      shear_optimal_max   = params.get<Real>("shear_optimal_max",   ZMC::shear_optimal_max_default);
+      shear_max           = params.get<Real>("shear_max",           ZMC::shear_max_default);
+      if (use_shear_scaling_mcsp || use_shear_scaling_evap) {
+        EKAT_REQUIRE_MSG(0 <= shear_min && shear_min < shear_optimal_min &&
+                         shear_optimal_min <= shear_optimal_max &&
+                         shear_optimal_max < shear_max,
+          "Error! ZmRuntimeOpt: shear scaling parameters must satisfy "
+          "0 <= shear_min < shear_optimal_min <= shear_optimal_max < shear_max, but got ("
+          << shear_min << ", " << shear_optimal_min << ", "
+          << shear_optimal_max << ", " << shear_max << ")\n");
+      }
 
       // determine SVP table size (add two to make the table slightly too big, just in case)
       plenest = static_cast<Int>(ZMC::tmax-ZMC::tmin) + 3;
@@ -230,7 +253,8 @@ struct Functions {
       os << "ZM deep convection parameter values:\n";
       os << indent << "tau             : " << tau            << "\n";
       os << indent << "alfa            : " << alfa           << "\n";
-      os << indent << "ke              : " << ke             << "\n";
+      os << indent << "evap_efficiency_min : " << evap_efficiency_min << "\n";
+      os << indent << "evap_efficiency_max : " << evap_efficiency_max << "\n";
       os << indent << "dmpdz           : " << dmpdz          << "\n";
       os << indent << "tpert_fix       : " << tpert_fix      << "\n";
       os << indent << "tpert_fac       : " << tpert_fac      << "\n";
@@ -255,13 +279,51 @@ struct Functions {
       os << indent << "mcsp_q_coeff    : " << mcsp_q_coeff   << "\n";
       os << indent << "mcsp_mom_coeff  : " << mcsp_mom_coeff << "\n";
       os << indent << "mcsp_use_full_shear : " << mcsp_use_full_shear << "\n";
+      // shear scaling parameters
+      os << indent << "use_shear_scaling_mcsp : " << use_shear_scaling_mcsp << "\n";
+      os << indent << "use_shear_scaling_evap : " << use_shear_scaling_evap << "\n";
+      os << indent << "shear_min       : " << shear_min      << "\n";
+      os << indent << "shear_optimal_min : " << shear_optimal_min << "\n";
+      os << indent << "shear_optimal_max : " << shear_optimal_max << "\n";
+      os << indent << "shear_max       : " << shear_max      << "\n";
       os << std::endl;
       os.flags(saved_flags);
     }
 
+    // -------------------------------------------------------------------------
+    // scalar shear metric used for MCSP gating/scaling and evaporation scaling:
+    // full shear magnitude, or the legacy signed zonal shear
+    KOKKOS_INLINE_FUNCTION
+    Real calc_shear_metric(const Real& shear_u, const Real& shear_v) const {
+      return mcsp_use_full_shear ? std::sqrt(shear_u * shear_u + shear_v * shear_v) : shear_u;
+    }
+
+    // -------------------------------------------------------------------------
+    // trapezoid shear scaling function in [0,1] - zero below shear_min and above
+    // shear_max, one between shear_optimal_min and shear_optimal_max, with
+    // linear ramps in between
+    KOKKOS_INLINE_FUNCTION
+    Real calc_shear_scaling(const Real& shear) const {
+      const Real shear_mag = std::abs(shear);
+      if (shear_mag <= shear_min || shear_mag >= shear_max) return 0;
+      if (shear_mag < shear_optimal_min) return (shear_mag - shear_min) / (shear_optimal_min - shear_min);
+      if (shear_mag > shear_optimal_max) return (shear_max - shear_mag) / (shear_max - shear_optimal_max);
+      return 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // evaporation efficiency, optionally interpolated between evap_efficiency_min
+    // and evap_efficiency_max by the shear scaling function
+    KOKKOS_INLINE_FUNCTION
+    Real calc_evap_efficiency(const Real& shear) const {
+      if (!use_shear_scaling_evap) return evap_efficiency_max;
+      return evap_efficiency_min + calc_shear_scaling(shear) * (evap_efficiency_max - evap_efficiency_min);
+    }
+
     Real tau;               // convective adjustment time scale
     Real alfa;              // max downdraft mass flux fraction
-    Real ke;                // evaporation efficiency
+    Real evap_efficiency_min; // evaporation efficiency for zero shear scaling (unused if use_shear_scaling_evap=false)
+    Real evap_efficiency_max; // evaporation efficiency for full shear scaling (always used if use_shear_scaling_evap=false)
     Real dmpdz;             // fractional mass entrainment rate [1/m]
     bool tpert_fix;         // flag to disable using applying tpert to PBL-rooted convection
     Real tpert_fac;         // tunable temperature perturbation factor
@@ -288,6 +350,13 @@ struct Functions {
     Real mcsp_q_coeff;      // MCSP coefficient for specific humidity tendencies
     Real mcsp_mom_coeff;    // MCSP momentum coefficient (dimensionless fraction of the shear)
     bool mcsp_use_full_shear; // use full (u,v) shear vector instead of zonal-only shear
+    // shear scaling parameters
+    bool use_shear_scaling_mcsp; // scale MCSP T/q coefficients by the shear scaling function
+    bool use_shear_scaling_evap; // scale evaporation efficiency by the shear scaling function
+    Real shear_min;         // shear below which the scaling is zero [m/s]
+    Real shear_optimal_min; // shear at which the scaling reaches full strength [m/s]
+    Real shear_optimal_max; // shear above which the scaling begins to decrease [m/s]
+    Real shear_max;         // shear above which the scaling is zero [m/s]
     // saturation vapor pressure (svp) table
     Int plenest;            // saturation vapor pressure table size
     view_1d<Real> estbl;    // saturation vapor pressure table values
@@ -413,7 +482,7 @@ struct Functions {
 
     // variable counters for device-side only
     static constexpr int num_1d_intgr =  5; // number of 1D integer views
-    static constexpr int num_1d_scalr =  6; // number of 1D scalar views
+    static constexpr int num_1d_scalr =  8; // number of 1D scalar views
     static constexpr int num_2d_midlv = 22; // number of 2D mid-point views
     static constexpr int num_2d_intfc =  5; // number of 2D interface views
     static constexpr int num_3d_midlv =  1; // number of 3D mid-point views (ncol,nwind,nlev)
@@ -461,6 +530,8 @@ struct Functions {
     uview_1d<Scalar> dsubcld;        // thickness between lcl and msemax_klev   [mb]
     uview_2d<Real>   ql;             // cloud liquid water for chem/wetdep      [?]
     uview_1d<Scalar> rliq;           // reserved liquid (not yet in cldliq) for energy integrals
+    uview_1d<Scalar> shear_u;        // zonal component of storm-relative shear      [m/s]
+    uview_1d<Scalar> shear_v;        // meridional component of storm-relative shear [m/s]
     uview_2d<Real>   dlf;            // detrainment rate of cloud liquid water  [kg/kg/s]
     // MCSP diagnostic outputs
     view_2d<Real>    mcsp_ds_out;    // MCSP tendency for DSE
@@ -776,6 +847,8 @@ struct Functions {
     const uview_1d<const Real>& state_q, // physics state specific humidity
     const uview_1d<const Real>& state_u, // physics state u momentum
     const uview_1d<const Real>& state_v, // physics state v momentum
+    const Real& shear_u, // zonal component of storm-relative shear
+    const Real& shear_v, // meridional component of storm-relative shear
     const uview_1d<const Real>& ptend_zm_s, // input ZM tendency for dry static energy (DSE)
     const uview_1d<const Real>& ptend_zm_q, // input ZM tendency for specific humidity (qv)
     // Inputs/Outputs
@@ -850,6 +923,7 @@ struct Functions {
     const Int& pver, // number of mid-point vertical levels
     const Int& pverp, // number of interface vertical levels
     const Real& time_step, // model time step                         [s]
+    const Real& evap_efficiency, // rain evaporation efficiency
     const uview_1d<const Real>& p_mid, // midpoint pressure                       [Pa]
     const uview_1d<const Real>& p_del, // layer thickness                         [Pa]
     const uview_1d<const Real>& t_mid, // temperature                             [K]
