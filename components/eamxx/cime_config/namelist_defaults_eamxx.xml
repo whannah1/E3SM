@@ -315,12 +315,12 @@ be lost if SCREAM_HACK_XML is not enabled.
       <mcsp_mom_coeff      type="real"    doc="MCSP momentum coefficient"       >0.0</mcsp_mom_coeff>
       <mcsp_use_full_shear type="logical" doc="MCSP flag to use full shear vector instead of zonal-only" >false</mcsp_use_full_shear>
       <!-- shear scaling (trapezoid function of 600 hPa to lowest level shear) -->
-      <use_shear_scaling_mcsp type="logical" doc="ZM flag to scale MCSP T/q coefficients by low-level shear (replaces legacy 3-200 m/s gate)">false</use_shear_scaling_mcsp>
+      <use_shear_scaling_mcsp type="logical" doc="ZM flag to scale MCSP T/q coefficients by low-level shear (otherwise MCSP is gated between shear_min and shear_max)">false</use_shear_scaling_mcsp>
       <use_shear_scaling_evap type="logical" doc="ZM flag to scale evaporation efficiency between evap_efficiency_min/max by low-level shear">false</use_shear_scaling_evap>
-      <shear_min          type="real"    doc="shear scaling: shear below which scaling is zero [m/s]"           >4.0</shear_min>
-      <shear_optimal_min  type="real"    doc="shear scaling: shear where ramp-up ends and full scaling begins [m/s]">12.0</shear_optimal_min>
-      <shear_optimal_max  type="real"    doc="shear scaling: shear where full scaling ends and ramp-down begins [m/s]">30.0</shear_optimal_max>
-      <shear_max          type="real"    doc="shear scaling: shear above which scaling is zero [m/s]"           >55.0</shear_max>
+      <shear_min          type="real"    doc="shear below which MCSP is inactive / shear scaling is zero [m/s]" >3.0</shear_min>
+      <shear_optimal_min  type="real"    doc="shear scaling: shear where ramp-up ends and full scaling begins [m/s]">20.0</shear_optimal_min>
+      <shear_optimal_max  type="real"    doc="shear scaling: shear where full scaling ends and ramp-down begins [m/s]">60.0</shear_optimal_max>
+      <shear_max          type="real"    doc="shear above which MCSP is inactive / shear scaling is zero [m/s]" >200.0</shear_max>
     </zm>
 
     <!-- Water tracers -->

@@ -117,17 +117,15 @@ struct Functions {
     // MCSP parameters
     static inline constexpr Real MCSP_storm_speed_pref     = 600e2;    // pressure level for winds in MCSP calculation Pa]
     static inline constexpr Real MCSP_conv_depth_min       = 700e2;    // pressure thickness of convective heating [Pa]
-    static inline constexpr Real MCSP_shear_gate_min       = 3.0;      // legacy min shear for MCSP to be active (use_shear_scaling_mcsp=false)
-    static inline constexpr Real MCSP_shear_gate_max       = 200.0;    // legacy max shear for MCSP to be active (use_shear_scaling_mcsp=false)
     static inline constexpr Real MCSP_t_coeff_default      = 0.3;      // default MCSP temperature coefficient
     static inline constexpr Real MCSP_q_coeff_default      = 0.0;      // default MCSP sp. humidity coefficient
     static inline constexpr Real MCSP_mom_coeff_default    = 0.0;      // default MCSP momentum coefficient (fraction of shear)
     static inline constexpr Real MCSP_mom_tau              = 3600.0;   // MCSP momentum tendency timescale [s]
     // shear scaling parameters (trapezoid function of low-level shear magnitude [m/s])
-    static inline constexpr Real shear_min_default         = 4.0;      // below this the shear scaling is zero
-    static inline constexpr Real shear_optimal_min_default = 12.0;     // ramp-up ends, full strength begins
-    static inline constexpr Real shear_optimal_max_default = 30.0;     // full strength ends, ramp-down begins
-    static inline constexpr Real shear_max_default         = 55.0;     // above this the shear scaling is zero
+    static inline constexpr Real shear_min_default         = 3.0;      // below this MCSP is inactive / the shear scaling is zero
+    static inline constexpr Real shear_optimal_min_default = 20.0;     // ramp-up ends, full strength begins
+    static inline constexpr Real shear_optimal_max_default = 60.0;     // full strength ends, ramp-down begins
+    static inline constexpr Real shear_max_default         = 200.0;    // above this MCSP is inactive / the shear scaling is zero
     // Default values for ZmRuntimeOpt fields
     static inline constexpr Real alfa                      = 0.14;     // default downdraft proportionality factor
     static inline constexpr Real evap_efficiency_min       = 2.5E-6;   // default evaporation efficiency for zero shear scaling
@@ -353,10 +351,10 @@ struct Functions {
     // shear scaling parameters
     bool use_shear_scaling_mcsp; // scale MCSP T/q coefficients by the shear scaling function
     bool use_shear_scaling_evap; // scale evaporation efficiency by the shear scaling function
-    Real shear_min;         // shear below which the scaling is zero [m/s]
+    Real shear_min;         // shear below which MCSP is inactive / the scaling is zero [m/s]
     Real shear_optimal_min; // shear at which the scaling reaches full strength [m/s]
     Real shear_optimal_max; // shear above which the scaling begins to decrease [m/s]
-    Real shear_max;         // shear above which the scaling is zero [m/s]
+    Real shear_max;         // shear above which MCSP is inactive / the scaling is zero [m/s]
     // saturation vapor pressure (svp) table
     Int plenest;            // saturation vapor pressure table size
     view_1d<Real> estbl;    // saturation vapor pressure table values
