@@ -106,15 +106,15 @@ void Functions<S,D>::zm_conv_mcsp_tend(
   // With use_shear_scaling_mcsp the hard shear gate is replaced by a trapezoid
   // function of the shear that scales the T/q coefficients (MCSP is inactive
   // wherever the scaling is zero). Otherwise the legacy hard gate between
-  // shear_min and shear_max is used and the coefficients are not modified.
+  // mcsp_shear_min and mcsp_shear_max is used and the coefficients are not modified.
   Real shear_scaling = 1;
   bool shear_active  = false;
   if (runtime_opt.use_shear_scaling_mcsp) {
-    shear_scaling = runtime_opt.calc_shear_scaling(mcsp_shear);
+    shear_scaling = runtime_opt.calc_mcsp_shear_scaling(mcsp_shear);
     shear_active  = (shear_scaling > 0);
   } else {
-    shear_active  = (std::abs(mcsp_shear) >= runtime_opt.shear_min &&
-                     std::abs(mcsp_shear) <  runtime_opt.shear_max);
+    shear_active  = (std::abs(mcsp_shear) >= runtime_opt.mcsp_shear_min &&
+                     std::abs(mcsp_shear) <  runtime_opt.mcsp_shear_max);
   }
   const Real mcsp_t_coeff = shear_scaling * runtime_opt.mcsp_t_coeff;
   const Real mcsp_q_coeff = shear_scaling * runtime_opt.mcsp_q_coeff;
