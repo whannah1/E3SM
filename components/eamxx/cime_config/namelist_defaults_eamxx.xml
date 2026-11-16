@@ -1018,6 +1018,8 @@ be lost if SCREAM_HACK_XML is not enabled.
     <dt_remap_factor hgrid="ne30np4">1</dt_remap_factor> <!-- addresses stability issues -->
     <dt_tracer_factor constraints="ge 1">1</dt_tracer_factor>
     <hv_ref_profiles>6</hv_ref_profiles>                <!-- Default (rough topography) -->
+    <hv_q_correction valid_values="0,1" doc="1: apply SL tracer HV on approximate pressure surfaces (reduces up-slope mixing of tracers over topography)">0</hv_q_correction>
+    <hv_q_thresh doc="soft cap on |dq/dp| [kg/kg/Pa] in the hv_q_correction term">1.0e-5</hv_q_thresh>
     <hypervis_order>2</hypervis_order>
     <hypervis_scaling>3.0</hypervis_scaling>
     <laplace_scaling>UNSET</laplace_scaling>

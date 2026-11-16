@@ -102,6 +102,8 @@ module control_mod
  integer, public :: hv_ref_profiles   = 0   ! 1=turn on theta model HV reference profiles
  integer, public :: hv_theta_correction=0   ! 1=use HV on p-surface approximation for theta
  real (kind=real_kind), public :: hv_theta_thresh=.025d0  ! d(theta)/dp max threshold for HV correction term
+ integer, public :: hv_q_correction=0     ! 1=use HV on p-surface approximation for SL tracer HV (semi_lagrange_hv_q tracers)
+ real (kind=real_kind), public :: hv_q_thresh=1.0d-5  ! dq/dp max threshold [kg/kg/Pa] for tracer HV correction term
 
  integer, public :: cubed_sphere_map = -1  ! -1 = chosen at run time
                                            !  0 = equi-angle Gnomonic (default)

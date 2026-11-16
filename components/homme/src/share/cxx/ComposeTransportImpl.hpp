@@ -86,6 +86,9 @@ struct ComposeTransportImpl {
     Real nu_q, hv_scaling, dp_tol, deta_tol;
     bool independent_time_steps;
     bool do_3d_turbulence;
+    // Pressure-surface correction to the tracer HV (hv_q_correction=1).
+    int hv_q_correction;
+    Real hv_q_thresh;
 
     // buf1o and buf1e point to the same memory, sized to the larger of the
     // two. They are used in different parts of the code.
@@ -102,13 +105,16 @@ struct ComposeTransportImpl {
     DeparturePoints dep_pts, vnode, vdep; // (ie,lev,i,j,d)
     DpSnaps dp_extra_snapshots; // (ie,snapshot,i,j,lev)
     VSnaps vel_extra_snapshots; // (ie,snapshot,d,i,j,lev)
+    // Weak Laplacian of layer-midpoint pressure, for hv_q_correction.
+    ExecViewManaged<Scalar*[NP][NP][NUM_LEV]> hv_q_lap_p; // (ie,i,j,lev)
 
     std::shared_ptr<VelocityRecord> vrec;
 
     Data ()
       : nelemd(-1), qsize(-1), limiter_option(9), cdr_check(0), hv_q(0),
         hv_subcycle_q(0), hv_subcycle_q_sgs(0), geometry_type(0), nu_q(0), hv_scaling(0), dp_tol(-1),
-        independent_time_steps(false), do_3d_turbulence(false)
+        independent_time_steps(false), do_3d_turbulence(false),
+        hv_q_correction(0), hv_q_thresh(0)
     {}
   };
 
@@ -156,7 +162,7 @@ struct ComposeTransportImpl {
                const int np1, const ExecViewUnmanaged<const Scalar*[NP][NP][NUM_LEV]>& dp,
                const ExecViewUnmanaged<Scalar*[2][NP][NP][NUM_LEV]>& v);
 
-  void advance_hypervis_scalar(const Real dt);
+  void advance_hypervis_scalar(const int np1, const Real dt);
   void advance_horizontal_turbulent_diffusion_scalar(const Real dt);
 
   int run_trajectory_unit_tests();

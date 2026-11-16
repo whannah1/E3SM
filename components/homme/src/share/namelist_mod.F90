@@ -106,6 +106,8 @@ use physical_constants, only : Sx, Sy, Lx, Ly, dx, dy, dx_ref, dy_ref
     hv_ref_profiles,     &
     hv_theta_correction, &
     hv_theta_thresh, &
+    hv_q_correction, &
+    hv_q_thresh, &
     vert_remap_q_alg, &
     vert_remap_u_alg, &
     se_fv_phys_remap_alg, &
@@ -335,6 +337,8 @@ use physical_constants, only : Sx, Sy, Lx, Ly, dx, dy, dx_ref, dy_ref
       hv_ref_profiles,       &
       hv_theta_correction,   &
       hv_theta_thresh,   &
+      hv_q_correction,   &
+      hv_q_thresh,   &
       vert_remap_q_alg, &
       vert_remap_u_alg, &
       se_fv_phys_remap_alg, &
@@ -799,6 +803,8 @@ use physical_constants, only : Sx, Sy, Lx, Ly, dx, dy, dx_ref, dy_ref
     call MPI_bcast(hv_ref_profiles,    1, MPIinteger_t, par%root,par%comm,ierr)
     call MPI_bcast(hv_theta_correction,1, MPIinteger_t, par%root,par%comm,ierr)
     call MPI_bcast(hv_theta_thresh,1, MPIreal_t, par%root,par%comm,ierr)
+    call MPI_bcast(hv_q_correction,1, MPIinteger_t, par%root,par%comm,ierr)
+    call MPI_bcast(hv_q_thresh,1, MPIreal_t, par%root,par%comm,ierr)
     call MPI_bcast(vert_remap_q_alg,1, MPIinteger_t, par%root,par%comm,ierr)
     call MPI_bcast(vert_remap_u_alg,1, MPIinteger_t, par%root,par%comm,ierr)
 
@@ -1206,6 +1212,17 @@ end if
        write(iulog,*)"readnl: hv_theta_thresh   = ",hv_theta_thresh
        if (hv_ref_profiles==0 .and. hv_theta_correction==1) then
           call abortmp("hv_theta_correction=1 requires hv_ref_profiles=1 or 2")
+       endif
+       write(iulog,*)"readnl: hv_q_correction   = ",hv_q_correction
+       write(iulog,*)"readnl: hv_q_thresh       = ",hv_q_thresh
+       if (hv_q_correction /= 0 .and. hv_q_correction /= 1) then
+          call abortmp("hv_q_correction must be 0 or 1")
+       endif
+       if (hv_q_correction==1 .and. transport_alg==0) then
+          call abortmp("hv_q_correction=1 is implemented only for semi-Lagrangian transport (transport_alg>0)")
+       endif
+       if (hv_q_correction==1 .and. hv_q_thresh <= 0) then
+          call abortmp("hv_q_correction=1 requires hv_q_thresh > 0")
        endif
        if (theta_advect_form==2 .and. pgrad_correction /= 0) then
           call abortmp("theta_advect_form=2 (splitform) should not be used with pgrad_correction/=0")

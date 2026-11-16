@@ -14,7 +14,8 @@ extern "C" void
 sl_get_params(double* nu_q, double* hv_scaling, int* hv_q, int* hv_subcycle_q, int* hv_subcycle_q_sgs,
               int* limiter_option, int* cdr_check, int* geometry_type,
               int* trajectory_nsubstep, int* trajectory_nvelocity,
-              int* diagnostics, bool* do_3d_turbulence);
+              int* diagnostics, bool* do_3d_turbulence,
+              int* hv_q_correction, double* hv_q_thresh);
 
 namespace Homme {
 
@@ -60,7 +61,8 @@ void ComposeTransportImpl::reset (const SimulationParams& params) {
   sl_get_params(&m_data.nu_q, &m_data.hv_scaling, &m_data.hv_q, &m_data.hv_subcycle_q, &m_data.hv_subcycle_q_sgs,
                 &m_data.limiter_option, &m_data.cdr_check, &m_data.geometry_type,
                 &m_data.trajectory_nsubstep, &m_data.trajectory_nvelocity,
-                &m_data.diagnostics, &m_data.do_3d_turbulence);
+                &m_data.diagnostics, &m_data.do_3d_turbulence,
+                &m_data.hv_q_correction, &m_data.hv_q_thresh);
 
   if (independent_time_steps != m_data.independent_time_steps or
       m_data.nelemd != num_elems or m_data.qsize != params.qsize) {
@@ -118,6 +120,13 @@ void ComposeTransportImpl::reset (const SimulationParams& params) {
   m_tp_ne_qsize = Homme::get_default_team_policy<ExecSpace>(m_data.nelemd * m_data.qsize);
   m_tu_ne = TeamUtils<ExecSpace>(m_tp_ne);
   m_tu_ne_qsize = TeamUtils<ExecSpace>(m_tp_ne_qsize);
+  if (m_data.hv_q_correction > 0) {
+    Errors::runtime_check(m_data.hv_q_thresh > 0,
+                          "hv_q_correction=1 requires hv_q_thresh > 0.");
+    if (m_data.nu_q > 0 && m_data.hv_q > 0)
+      m_data.hv_q_lap_p = decltype(m_data.hv_q_lap_p)("hv_q_lap_p", m_data.nelemd);
+  }
+
   if (m_data.nu_q > 0 && m_data.hv_q > 0) {
     m_tp_ne_hv_q = Homme::get_default_team_policy<ExecSpace>(m_data.nelemd * m_data.hv_q);
     m_tu_ne_hv_q = TeamUtils<ExecSpace>(m_tp_ne_hv_q);
@@ -245,7 +254,7 @@ void ComposeTransportImpl::run (const TimeLevel& tl, const Real dt) {
 
   if (m_data.hv_q > 0 && m_data.nu_q > 0) {
     GPTLstart("compose_hypervis_scalar");
-    advance_hypervis_scalar(dt);
+    advance_hypervis_scalar(tl.np1, dt);
     Kokkos::fence();
     GPTLstop("compose_hypervis_scalar");
   }

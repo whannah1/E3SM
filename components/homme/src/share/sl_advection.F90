@@ -195,15 +195,16 @@ contains
 
   subroutine sl_get_params(nu_q_out, hv_scaling, hv_q, hv_subcycle_q, hv_subcycle_q_sgs, limiter_option_out, &
        cdr_check, geometry_type, trajectory_nsubstep, trajectory_nvelocity, diagnostics, &
-       do_3d_turbulence_out) bind(c)
+       do_3d_turbulence_out, hv_q_correction_out, hv_q_thresh_out) bind(c)
     use control_mod, only: semi_lagrange_hv_q, hypervis_subcycle_q, horiz_turb_subcycle_q, semi_lagrange_cdr_check, &
          nu_q, hypervis_scaling, limiter_option, geometry, semi_lagrange_trajectory_nsubstep, &
-         semi_lagrange_trajectory_nvelocity, semi_lagrange_diagnostics, do_3d_turbulence
+         semi_lagrange_trajectory_nvelocity, semi_lagrange_diagnostics, do_3d_turbulence, &
+         hv_q_correction, hv_q_thresh
     use iso_c_binding, only: c_int, c_double, c_bool
 
-    real(c_double), intent(out) :: nu_q_out, hv_scaling
+    real(c_double), intent(out) :: nu_q_out, hv_scaling, hv_q_thresh_out
     integer(c_int), intent(out) :: hv_q, hv_subcycle_q, hv_subcycle_q_sgs, limiter_option_out, cdr_check, &
-         geometry_type, trajectory_nsubstep, trajectory_nvelocity, diagnostics
+         geometry_type, trajectory_nsubstep, trajectory_nvelocity, diagnostics, hv_q_correction_out
     logical(c_bool), intent(out) :: do_3d_turbulence_out
 
     nu_q_out = nu_q
@@ -220,6 +221,8 @@ contains
     trajectory_nvelocity = semi_lagrange_trajectory_nvelocity
     diagnostics = semi_lagrange_diagnostics
     do_3d_turbulence_out = do_3d_turbulence
+    hv_q_correction_out = hv_q_correction
+    hv_q_thresh_out = hv_q_thresh
   end subroutine sl_get_params
 
   subroutine init_velocity_record(nelemd, dtf, drf_param, nsub, nvel_param, v, error)
@@ -415,7 +418,8 @@ contains
 
     if (semi_lagrange_hv_q > 0 .and. nu_q > 0) then
        n = semi_lagrange_hv_q
-       call advance_hypervis_scalar(elem, hvcoord, hybrid, deriv, tl%np1, np1_qdp, nets, nete, dt, n)
+       call advance_hypervis_scalar(elem, hvcoord, hybrid, deriv, tl%np1, np1_qdp, nets, nete, dt, n, &
+            independent_time_steps)
        ! No barrier needed: advance_hypervis_scalar has a horiz thread barrier at the end.
     end if
 
@@ -794,12 +798,21 @@ contains
 #endif
   end subroutine perf_barrier
 
-  subroutine advance_hypervis_scalar(elem, hvcoord , hybrid , deriv , nt , nt_qdp , nets , nete , dt2, nq)
+  subroutine advance_hypervis_scalar(elem, hvcoord , hybrid , deriv , nt , nt_qdp , nets , nete , dt2, nq, &
+       independent_time_steps)
     !  hyperviscsoity operator for foward-in-time scheme
     !  take one timestep of:
     !          Q(:,:,:,np) = Q(:,:,:,np) +  dt2*nu*laplacian**order ( Q )
     !
     !  For correct scaling, dt2 should be the same 'dt2' used in the leapfrog advace
+    !
+    !  If hv_q_correction=1, the first Laplacian is replaced by an approximation
+    !  of the Laplacian on pressure surfaces,
+    !          lap_p(Q) ~ lap_eta(Q) - dQ/dp * lap_eta(p)
+    !  using the current layer pressures and the local, current vertical gradient
+    !  of Q (limited by hv_q_thresh). This keeps the tracer HV from mixing Q along
+    !  terrain-following model levels, which over steep topography acts like a
+    !  spurious vertical (up-slope) flux.
     use kinds          , only : real_kind
     use dimensions_mod , only : np, nlev
     use hybrid_mod     , only : hybrid_t
@@ -807,7 +820,8 @@ contains
     use derivative_mod , only : derivative_t
     use bndry_mod      , only : bndry_exchangev
     use perf_mod       , only : t_startf, t_stopf                          ! _EXTERNAL
-    use control_mod    , only : nu_q, hypervis_subcycle_q
+    use control_mod    , only : nu_q, hypervis_subcycle_q, hv_q_correction
+    use derivative_mod , only : laplace_sphere_wk
     implicit none
     type (element_t)     , intent(inout), target :: elem(:)
     type (hvcoord_t)     , intent(in   )         :: hvcoord
@@ -819,10 +833,12 @@ contains
     integer              , intent(in   )         :: nete
     integer              , intent(in   )         :: nq
     real (kind=real_kind), intent(in   )         :: dt2
+    logical              , intent(in   )         :: independent_time_steps
 
     ! local
     real (kind=real_kind), dimension(np,np,nlev,nq,nets:nete) :: Qtens
-    real (kind=real_kind) :: dt
+    real (kind=real_kind), allocatable :: dp_q(:,:,:,:), lap_p_wk(:,:,:,:)
+    real (kind=real_kind) :: dt, p_mid(np,np)
     integer :: k , ie , ic , q
 
     if ( nu_q           == 0 ) return
@@ -831,6 +847,25 @@ contains
     call t_startf('advance_hypervis_scalar')
 
     dt = dt2 / hypervis_subcycle_q
+
+    if (hv_q_correction > 0) then
+       ! Layer thicknesses of the levels Q lives on at this point, matching what
+       ! CEDR uses, and the weak Laplacian of the layer-midpoint pressure. The
+       ! pressure doesn't change during the HV subcycles, so compute it once.
+       allocate(dp_q(np,np,nlev,nets:nete), lap_p_wk(np,np,nlev,nets:nete))
+       do ie = nets , nete
+          if (independent_time_steps) then
+             dp_q(:,:,:,ie) = elem(ie)%derived%divdp(:,:,:) ! dp_star
+          else
+             dp_q(:,:,:,ie) = elem(ie)%state%dp3d(:,:,:,nt)
+          end if
+          p_mid(:,:) = hvcoord%hyai(1)*hvcoord%ps0 + dp_q(:,:,1,ie)/2
+          do k = 1 , nlev
+             if (k > 1) p_mid(:,:) = p_mid(:,:) + (dp_q(:,:,k-1,ie) + dp_q(:,:,k,ie))/2
+             lap_p_wk(:,:,k,ie) = laplace_sphere_wk(p_mid,deriv,elem(ie),var_coef=.false.)
+          enddo
+       enddo
+    end if
 
     do ic = 1 , hypervis_subcycle_q
        do ie = nets , nete
@@ -845,7 +880,12 @@ contains
        enddo ! ie loop
 
        ! compute biharmonic operator. Qtens = input and output
-       call biharmonic_wk_scalar( elem , Qtens , deriv , edge_g , hybrid , nets , nete, nq )
+       if (hv_q_correction > 0) then
+          call biharmonic_wk_scalar( elem , Qtens , deriv , edge_g , hybrid , nets , nete, nq, &
+               dp_q, lap_p_wk )
+       else
+          call biharmonic_wk_scalar( elem , Qtens , deriv , edge_g , hybrid , nets , nete, nq )
+       end if
 
        do ie = nets , nete
 #if (defined COLUMN_OPENMP)
@@ -882,17 +922,21 @@ contains
 #endif
 #endif
     enddo
+    if (allocated(dp_q)) deallocate(dp_q, lap_p_wk)
     call t_stopf('advance_hypervis_scalar')
   end subroutine advance_hypervis_scalar
 
-  subroutine biharmonic_wk_scalar(elem,qtens,deriv,edgeq,hybrid,nets,nete,nq)
+  subroutine biharmonic_wk_scalar(elem,qtens,deriv,edgeq,hybrid,nets,nete,nq,dp_q,lap_p_wk)
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     ! compute weak biharmonic operator
     !    input:  qtens = Q
     !    output: qtens = weak biharmonic of Q
     !
+    ! If dp_q and lap_p_wk are present, the first Laplacian gets the pressure
+    ! surface correction  - dQ/dp * lap_wk(p)  (see advance_hypervis_scalar).
+    !
     !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    use control_mod, only : hypervis_scaling
+    use control_mod, only : hypervis_scaling, hv_q_thresh
     use derivative_mod, only : laplace_sphere_wk
 
     type (hybrid_t)      , intent(in) :: hybrid
@@ -901,23 +945,44 @@ contains
     real (kind=real_kind), dimension(np,np,nlev,nq,nets:nete) :: qtens
     type (EdgeBuffer_t)  , intent(inout) :: edgeq
     type (derivative_t)  , intent(in) :: deriv
+    real (kind=real_kind), intent(in), optional :: dp_q(np,np,nlev,nets:nete)
+    real (kind=real_kind), intent(in), optional :: lap_p_wk(np,np,nlev,nets:nete)
 
     ! local
     integer :: k,ie,q
-    real (kind=real_kind), dimension(np,np) :: lap_p
+    logical :: do_correction
+    real (kind=real_kind), dimension(np,np) :: lap_p, dqdp
+    real (kind=real_kind), dimension(np,np,nlevp) :: q_i
+
+    do_correction = present(dp_q) .and. present(lap_p_wk)
 
     !if tensor hyperviscosity with tensor V is used, then biharmonic operator is (\grad\cdot V\grad) (\grad \cdot \grad) 
     !so tensor is only used on second call to laplace_sphere_wk
 
     do ie=nets,nete
 #if (defined COLUMN_OPENMP)
-       !$omp parallel do private(k, q, lap_p)
+       !$omp parallel do private(k, q, lap_p, dqdp, q_i)
 #endif
        do q=1,nq
+          if (do_correction) then
+             ! Q at layer interfaces, one-sided at the top and bottom
+             q_i(:,:,1) = qtens(:,:,1,q,ie)
+             q_i(:,:,nlevp) = qtens(:,:,nlev,q,ie)
+             do k=2,nlev
+                q_i(:,:,k) = (qtens(:,:,k,q,ie) + qtens(:,:,k-1,q,ie))/2
+             enddo
+          end if
           do k=1,nlev    !  Potential loop inversion (AAM)
              lap_p(:,:)=qtens(:,:,k,q,ie)
              ! Original use of qtens on left and right hand sides caused OpenMP errors (AAM)
              qtens(:,:,k,q,ie)=laplace_sphere_wk(lap_p,deriv,elem(ie),var_coef=.false.)
+             if (do_correction) then
+                ! lap on p-surfaces ~ lap on model levels - dQ/dp * lap(p),
+                ! with dQ/dp smoothly capped at hv_q_thresh
+                dqdp(:,:) = (q_i(:,:,k+1) - q_i(:,:,k))/dp_q(:,:,k,ie)
+                dqdp(:,:) = dqdp(:,:)/(1 + abs(dqdp(:,:))/hv_q_thresh)
+                qtens(:,:,k,q,ie) = qtens(:,:,k,q,ie) - dqdp(:,:)*lap_p_wk(:,:,k,ie)
+             end if
           enddo
           call edgeVpack_nlyr(edgeq, elem(ie)%desc, qtens(:,:,:,q,ie),nlev,nlev*(q-1),nq*nlev)
        enddo
