@@ -34,6 +34,12 @@ void ZMDeepConvection::create_requests ()
   // set runtime options
   ZMF::s_zm_opts.load_runtime_options(m_params);
 
+  // plume freezing relies on the old_snow treatment in zm_conv_evap to avoid
+  // double counting the latent heat of fusion of convective snow
+  EKAT_REQUIRE_MSG(!ZMF::s_zm_opts.use_plume_freezing ||
+                   (ZMF::s_zm_opts.old_snow && !ZMF::s_zm_opts.zm_microp),
+                   "Error! ZM use_plume_freezing requires old_snow=true and zm_microp=false.\n");
+
   m_grid = m_grids_manager->get_grid("physics");
 
   const auto& grid_name = m_grid->name();
@@ -280,6 +286,8 @@ void ZMDeepConvection::run_impl (const double dt)
   const auto loc_zm_output_ql               = zm_output.ql;
   const auto loc_zm_output_rliq             = zm_output.rliq;
   const auto loc_zm_output_dlf              = zm_output.dlf;
+  const auto loc_zm_output_dif              = zm_output.dif;
+  const auto loc_zm_output_snow_prod        = zm_output.snow_prod;
 
   //----------------------------------------------------------------------------
   // calculate altitude on interfaces (z_int) and mid-points (z_mid)
@@ -332,7 +340,8 @@ void ZMDeepConvection::run_impl (const double dt)
                     zm_output.mflx_dn, zm_output.entr_dn,
                     zm_output.p_del_mb, zm_output.dsubcld,
                     zm_output.ql, zm_output.rliq, zm_output.rain_prod, zm_output.dlf,
-                    zm_output.ktm, zm_output.kbm );
+                    zm_output.ktm, zm_output.kbm,
+                    zm_output.dif, zm_output.snow_prod );
   stop_timer("EAMxx::zm::main");
 
   //--------------------------------------------------------------------------
@@ -436,6 +445,7 @@ void ZMDeepConvection::run_impl (const double dt)
     const auto tmp_T_mid_i        = ekat::subview(loc_zm_input_tmp_T_mid, i);
     const auto tmp_qv_i           = ekat::subview(loc_zm_input_tmp_qv, i);
     const auto rain_prod_i        = ekat::subview(loc_zm_output_rain_prod, i);
+    const auto snow_prod_i        = ekat::subview(loc_zm_output_snow_prod, i);
     const auto cldfrac_i          = ekat::subview(loc_zm_input_cldfrac, i);
     const auto tend_out_s_i       = ekat::subview(loc_zm_output_tend_out_s, i);
     const auto tend_out_qv_i      = ekat::subview(loc_zm_output_tend_out_qv, i);
@@ -455,7 +465,7 @@ void ZMDeepConvection::run_impl (const double dt)
       p_mid_i, p_del_i, tmp_T_mid_i, tmp_qv_i, rain_prod_i, cldfrac_i,
       tend_tmp_s_i, tend_tmp_qv_i, tend_s_snwprd_i, tend_s_snwevmlt_i,
       loc_zm_output_prec(i), loc_zm_output_snow(i),
-      ntprprd_i, ntsnprd_i, flxprec_i, flxsnow_i );
+      ntprprd_i, ntsnprd_i, flxprec_i, flxsnow_i, snow_prod_i );
 
     // add zm_conv_evap() tendencies to output tendencies and update temporary state variables
     Kokkos::parallel_for(Kokkos::TeamVectorRange(team, nlev_mid), [&] (const int k) {
@@ -569,7 +579,15 @@ void ZMDeepConvection::run_impl (const double dt)
       // latent heat of fusion released when detrained condensate, which is
       // liquid-only in ZM without zm_microp, is partitioned into ice
       // (mirrors EAM: ptend%s = dlf * ice_frac * latice in clubb_intr.F90)
-      T_mid(i,k)   += zm_detr_qi(i,k) * PC::LatIce.value / PC::CP.value * dt;
+      // With use_plume_freezing, the part of dlf frozen in the plume (dif) has
+      // already released its latent heat, so only the difference is applied
+      // (negative if the plume froze more than the partition above assumes).
+      Real detr_qi_frz = zm_detr_qi(i,k);
+      if (zm_opts.use_plume_freezing) {
+        detr_qi_frz -= Kokkos::min(Kokkos::max(loc_zm_output_dif(i,k), 0.0),
+                                   Kokkos::max(loc_zm_output_dlf(i,k), 0.0));
+      }
+      T_mid(i,k)   += detr_qi_frz * PC::LatIce.value / PC::CP.value * dt;
     }
     winds_v(i,0,k) += loc_zm_output_tend_out_u (i,k) * dt;
     winds_v(i,1,k) += loc_zm_output_tend_out_v (i,k) * dt;
@@ -759,6 +777,7 @@ void ZMDeepConvection::init_buffers(const ATMBufferManager &buffer_manager)
                                                                   &zm_output.p_del_mb,
                                                                   &zm_output.ql,
                                                                   &zm_output.dlf,
+                                                                  &zm_output.dif,
                                                                 };
   for (auto& v : ptrs_2d_midlv) {
     *v = ZMF::uview_2d<Real>(r_mem, m_ncol, nlev_mid);

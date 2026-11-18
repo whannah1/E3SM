@@ -156,6 +156,7 @@ void Functions<S,D>::ZmOutputTend::init_all(int ncol, int nlev_mid)
   auto loc_rain_prod   = rain_prod;
   auto loc_snow_prod   = snow_prod;
   auto loc_dlf         = dlf;
+  auto loc_dif         = dif;
   auto loc_prec_flux   = prec_flux;
   auto loc_snow_flux   = snow_flux;
   auto loc_mass_flux   = mass_flux;
@@ -190,6 +191,7 @@ void Functions<S,D>::ZmOutputTend::init_all(int ncol, int nlev_mid)
     loc_rain_prod    (icol,klev) = init_fill_value;
     loc_snow_prod    (icol,klev) = init_fill_value;
     loc_dlf          (icol,klev) = init_fill_value;
+    loc_dif          (icol,klev) = init_fill_value;
     loc_mcsp_ds_out  (icol,klev) = init_fill_value;
     loc_mcsp_dq_out  (icol,klev) = init_fill_value;
     loc_mcsp_du_out  (icol,klev) = init_fill_value;

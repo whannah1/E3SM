@@ -66,7 +66,9 @@ void Functions<S,D>::zm_conv_main(
   const uview_2d<Real>& rprd,
   const uview_2d<Real>& dlf,
   Int& ktm,
-  Int& kbm)
+  Int& kbm,
+  const uview_2d<Real>& dif,
+  const uview_2d<Real>& sprd)
 {
   //----------------------------------------------------------------------------
   // Purpose: Main driver for Zhang-McFarlane convection scheme
@@ -78,6 +80,15 @@ void Functions<S,D>::zm_conv_main(
   constexpr Real cpair  = PC::Cpair.value;
 
   const Int msg = runtime_opt.limcnv - 1;
+
+  // Optional plume freezing outputs must be provided when it is enabled
+  const bool use_frz = runtime_opt.use_plume_freezing;
+  if (use_frz) {
+    EKAT_REQUIRE_MSG(dif.extent_int(0) >= ncol && dif.extent_int(1) == pver &&
+                     sprd.extent_int(0) >= ncol && sprd.extent_int(1) == pver,
+                     "Error! zm_conv_main: dif and sprd must be [ncol,pver] views "
+                     "when use_plume_freezing is enabled.\n");
+  }
 
   //----------------------------------------------------------------------------
   // Allocate temporary 2D device views  [ncol, pver] or [ncol, pverp]
@@ -108,6 +119,14 @@ void Functions<S,D>::zm_conv_main(
   view_2d<Real>
     p_int    ("p_int",     ncol, pverp),
     z_int    ("z_int",     ncol, pverp);
+  // Plume freezing temporaries (zero vertical extent when disabled)
+  const Int pver_frz = use_frz ? pver : 0;
+  view_2d<Real>
+    frz      ("frz",       ncol, pver_frz),
+    qi       ("qi",        ncol, pver_frz);
+  // Optional outputs, or zero vertical extent placeholders when disabled
+  uview_2d<Real> dif_v  = use_frz ? dif  : uview_2d<Real>(frz.data(), ncol, 0);
+  uview_2d<Real> sprd_v = use_frz ? sprd : uview_2d<Real>(frz.data(), ncol, 0);
 
   // Per-column scalar temporaries [ncol]
   view_1d<Real>
@@ -184,6 +203,10 @@ void Functions<S,D>::zm_conv_main(
       mflx_dn(i,k)   = 0;
       entr_dn(i,k)   = 0;
       t_pcl(i,k)     = 0;
+      if (use_frz) {
+        dif_v(i,k)   = 0;
+        sprd_v(i,k)  = 0;
+      }
     });
     team.team_barrier();
 
@@ -378,7 +401,9 @@ void Functions<S,D>::zm_conv_main(
                         ekat::subview(ql, i), ekat::subview(s_dnd, i),
                         ekat::subview(q_dnd, i), ekat::subview(qst, i),
                         ekat::subview(cu, i), ekat::subview(evp, i),
-                        ekat::subview(pflx, i), ekat::subview(rprd, i));
+                        ekat::subview(pflx, i), ekat::subview(rprd, i),
+                        ekat::subview(frz, i), ekat::subview(qi, i),
+                        ekat::subview(sprd_v, i));
   });
   Kokkos::fence();
 
@@ -396,6 +421,10 @@ void Functions<S,D>::zm_conv_main(
       cu(i,k)      = cu(i,k)      * dz / p_del(i,k);
       rprd(i,k)    = rprd(i,k)    * dz / p_del(i,k);
       evp(i,k)     = evp(i,k)     * dz / p_del(i,k);
+      if (use_frz) {
+        frz(i,k)   = frz(i,k)     * dz / p_del(i,k);
+        sprd_v(i,k) = sprd_v(i,k) * dz / p_del(i,k);
+      }
     });
   });
   Kokkos::fence();
@@ -476,6 +505,10 @@ void Functions<S,D>::zm_conv_main(
       cu(i,k)       *= cld_base_mass_flux(i);
       evp(i,k)      *= cld_base_mass_flux(i);
       pflx(i,k+1)   *= cld_base_mass_flux(i) * ZMC::mb_to_pa / gravit;
+      if (use_frz) {
+        frz(i,k)    *= cld_base_mass_flux(i);
+        sprd_v(i,k) *= cld_base_mass_flux(i);
+      }
     });
   });
   Kokkos::fence();
@@ -519,7 +552,9 @@ void Functions<S,D>::zm_conv_main(
                         ekat::subview(ql, i), ekat::subview(evp, i),
                         ekat::subview(cu, i),
                         ekat::subview(dsdt, i), ekat::subview(dqdt, i),
-                        ekat::subview(dl, i));
+                        ekat::subview(dl, i),
+                        ekat::subview(frz, i), ekat::subview(qi, i),
+                        ekat::subview(dif_v, i));
   });
   Kokkos::fence();
 

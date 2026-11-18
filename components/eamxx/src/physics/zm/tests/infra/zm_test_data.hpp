@@ -860,6 +860,16 @@ struct ZmCalcOutputTendData : public PhysicsTestData {
   }
 };
 
+// Optional plume freezing (use_plume_freezing) inputs/outputs for the glue
+// functions below, all [pcols,pver] in C layout
+struct ZmPlumeFrzData {
+  bool use_plume_freezing = true;
+  std::vector<Real> frz;  // plume freezing rate          (zm_cloud_properties out, zm_calc_output_tend in)
+  std::vector<Real> qi;   // plume ice condensate         (zm_cloud_properties out, zm_calc_output_tend in)
+  std::vector<Real> sprd; // plume ice converted to precip (zm_cloud_properties out, zm_conv_evap in)
+  std::vector<Real> di;   // detrained plume ice          (zm_calc_output_tend out)
+};
+
 // Glue functions for host test data
 void ientropy(IentropyData& d);
 void entropy(EntropyData& d);
@@ -873,11 +883,14 @@ void zm_conv_mcsp_calculate_shear(ZmConvMcspCalculateShearData& d);
 void zm_conv_mcsp_tend(ZmConvMcspTendData& d);
 std::vector<bool> zm_conv_main(ZmConvMainData& d);
 void zm_conv_evap(ZmConvEvapData& d);
+void zm_conv_evap(ZmConvEvapData& d, const ZmPlumeFrzData* f);
 void zm_calc_fractional_entrainment(ZmCalcFractionalEntrainmentData& d);
 void zm_downdraft_properties(ZmDowndraftPropertiesData& d);
 void zm_cloud_properties(ZmCloudPropertiesData& d);
+void zm_cloud_properties(ZmCloudPropertiesData& d, ZmPlumeFrzData* f);
 void zm_closure(ZmClosureData& d);
 void zm_calc_output_tend(ZmCalcOutputTendData& d);
+void zm_calc_output_tend(ZmCalcOutputTendData& d, ZmPlumeFrzData* f);
 // End glue function decls
 
 }  // namespace zm

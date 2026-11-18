@@ -140,6 +140,11 @@ struct Functions {
 
     static inline constexpr Real dlf_tk1 = 268.15; // T at/above which detrained condensate (dlf) is assumed to be liquid
     static inline constexpr Real dlf_tk2 = 238.15; // T at/below which detrained condensate (dlf) is assumed to be ice
+
+    // Updraft temperature ramp for the ice fraction of plume condensate when
+    // use_plume_freezing is enabled (same values as zm_microp in EAM)
+    static inline constexpr Real plume_frz_tk1 = 273.15; // T at/above which plume condensate is all liquid
+    static inline constexpr Real plume_frz_tk2 = 233.15; // T at/below which plume condensate is all ice
   };
 
   //----------------------------------------------------------------------------
@@ -171,6 +176,8 @@ struct Functions {
       // ZM micro parameters
       zm_microp           = params.get<bool>("zm_microp",           false);
       old_snow            = params.get<bool>("old_snow",            true);
+      // plume freezing (latent heat of fusion in the updraft plume)
+      use_plume_freezing  = params.get<bool>("use_plume_freezing",  false);
       // MCSP parameters
       mcsp_enabled        = params.get<bool>("mcsp_enabled",        true);
       mcsp_t_coeff        = params.get<Real>("mcsp_t_coeff",        ZMC::MCSP_t_coeff_default);
@@ -249,6 +256,7 @@ struct Functions {
       // ZM micro parameters
       os << indent << "zm_microp       : " << zm_microp      << "\n";
       os << indent << "old_snow        : " << old_snow       << "\n";
+      os << indent << "use_plume_freezing : " << use_plume_freezing << "\n";
       // MCSP parameters
       os << indent << "mcsp_enabled    : " << mcsp_enabled   << "\n";
       os << indent << "mcsp_t_coeff    : " << mcsp_t_coeff   << "\n";
@@ -282,6 +290,16 @@ struct Functions {
     // ZM micro parameters
     bool zm_microp;         // switch for convective microphysics
     bool old_snow;          // switch to calculate snow prod in zm_conv_evap() (old treatment before zm_microp was implemented)
+    bool use_plume_freezing = false; // include latent heat of fusion of freezing condensate in the updraft plume
+
+    // Ice fraction of updraft plume condensate as a function of updraft temperature,
+    // linear between plume_frz_tk1 (all liquid) and plume_frz_tk2 (all ice)
+    KOKKOS_INLINE_FUNCTION
+    static Real calc_plume_ice_frac(const Real& t_upd) {
+      if (t_upd >= ZMC::plume_frz_tk1) return 0;
+      if (t_upd <= ZMC::plume_frz_tk2) return 1;
+      return (ZMC::plume_frz_tk1 - t_upd) / (ZMC::plume_frz_tk1 - ZMC::plume_frz_tk2);
+    }
     // MCSP parameters
     bool mcsp_enabled;      // flag for mesoscale coherent structure parameterization (MSCP)
     Real mcsp_t_coeff;      // MCSP coefficient for temperature tendencies
@@ -414,7 +432,7 @@ struct Functions {
     // variable counters for device-side only
     static constexpr int num_1d_intgr =  3; // number of 1D integer views
     static constexpr int num_1d_scalr =  6; // number of 1D scalar views
-    static constexpr int num_2d_midlv = 22; // number of 2D mid-point views
+    static constexpr int num_2d_midlv = 23; // number of 2D mid-point views
     static constexpr int num_2d_intfc =  5; // number of 2D interface views
     static constexpr int num_3d_midlv =  1; // number of 3D mid-point views (ncol,nwind,nlev)
     static constexpr int num_f_midlv  = 13; // number of fortran-bridge (LayoutLeft) 2D mid-point views
@@ -436,6 +454,7 @@ struct Functions {
     uview_2d<Real>   tend_s_snwevmlt;// Heating rate of snow evap/melt          [J/kg/s]
     uview_2d<Real>   rain_prod;      // rain production rate                    [kg/kg/s]
     uview_2d<Real>   snow_prod;      // snow production rate                    [kg/kg/s]
+                                     // (use_plume_freezing: plume ice converted to precip, gross of downdraft evap)
     uview_2d<Real>   ntprprd;        // net precip production in layer          [kg/kg/s]
     uview_2d<Real>   ntsnprd;        // net snow production in layer            [kg/kg/s]
     uview_2d<Real>   flxprec;        // Convective flux of prec at interfaces   [kg/m2/s]
@@ -460,6 +479,7 @@ struct Functions {
     uview_2d<Real>   ql;             // cloud liquid water for chem/wetdep      [?]
     uview_1d<Scalar> rliq;           // reserved liquid (not yet in cldliq) for energy integrals
     uview_2d<Real>   dlf;            // detrainment rate of cloud liquid water  [kg/kg/s]
+    uview_2d<Real>   dif;            // ice part of dlf frozen in the plume     [kg/kg/s] (use_plume_freezing only)
     // MCSP diagnostic outputs
     view_2d<Real>    mcsp_ds_out;    // MCSP tendency for DSE
     view_2d<Real>    mcsp_dq_out;    // MCSP tendency for qv
@@ -837,7 +857,10 @@ struct Functions {
     const uview_2d<Real>& rprd, // rain production rate                    [kg/kg/s][ncol,pver]
     const uview_2d<Real>& dlf, // detrainment rate of cloud liquid water  [kg/kg/s][ncol,pver]
     Int& ktm, // highest cloud-top level index over active columns
-    Int& kbm); // highest cloud-base level index over active columns
+    Int& kbm, // highest cloud-base level index over active columns
+    // Optional outputs, only used (and required) when runtime_opt.use_plume_freezing is true
+    const uview_2d<Real>& dif  = uview_2d<Real>(), // ice part of dlf frozen in plume  [kg/kg/s][ncol,pver]
+    const uview_2d<Real>& sprd = uview_2d<Real>()); // plume ice converted to precip   [kg/kg/s][ncol,pver]
 
   KOKKOS_FUNCTION
   static void zm_conv_evap(
@@ -866,7 +889,9 @@ struct Functions {
     const uview_1d<Real>& ntprprd, // net precip production in layer          [kg/kg/s]
     const uview_1d<Real>& ntsnprd, // net snow production in layer            [kg/kg/s]
     const uview_1d<Real>& flxprec, // Convective flux of prec at interfaces   [kg/m2/s]
-    const uview_1d<Real>& flxsnow); // Convective flux of snow at interfaces   [kg/m2/s]);
+    const uview_1d<Real>& flxsnow, // Convective flux of snow at interfaces   [kg/m2/s]
+    // Optional input, only used when runtime_opt.use_plume_freezing is true
+    const uview_1d<const Real>& prdsnow_plume = uview_1d<const Real>()); // plume ice converted to precip [kg/kg/s]
 
   KOKKOS_FUNCTION
   static void zm_calc_fractional_entrainment(
@@ -971,7 +996,11 @@ struct Functions {
     const uview_1d<Real>& cu, // condensation rate
     const uview_1d<Real>& evp, // evaporation rate
     const uview_1d<Real>& pflx, // precipitation flux thru layer
-    const uview_1d<Real>& rprd); // rate of production of precip at that layer
+    const uview_1d<Real>& rprd, // rate of production of precip at that layer
+    // Optional outputs, only used (and required) when runtime_opt.use_plume_freezing is true
+    const uview_1d<Real>& frz  = uview_1d<Real>(), // freezing rate of plume condensate (same units as cu)
+    const uview_1d<Real>& qi   = uview_1d<Real>(), // plume ice condensate, part of ql   [kg/kg]
+    const uview_1d<Real>& sprd = uview_1d<Real>()); // plume ice converted to precip (same units as rprd)
 
   KOKKOS_FUNCTION
   static void zm_closure(
@@ -1042,7 +1071,11 @@ struct Functions {
     // Outputs
     const uview_1d<Real>& dsdt, // output tendency for dry static energy
     const uview_1d<Real>& dqdt, // output tendency for specific humidity
-    const uview_1d<Real>& dl); // output tendency for cloud liquid water
+    const uview_1d<Real>& dl, // output tendency for cloud liquid water
+    // Optional arguments, only used when frz has nonzero extent (use_plume_freezing)
+    const uview_1d<const Real>& frz = uview_1d<const Real>(), // plume freezing rate
+    const uview_1d<const Real>& qi  = uview_1d<const Real>(), // plume ice condensate
+    const uview_1d<Real>&       di  = uview_1d<Real>()); // output detrainment of plume ice
 
   //
   // --------- Members ---------

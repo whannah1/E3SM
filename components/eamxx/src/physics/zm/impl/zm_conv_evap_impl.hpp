@@ -39,8 +39,16 @@ void Functions<S,D>::zm_conv_evap(
   const uview_1d<Real>& ntprprd, // net precip production in layer          [kg/kg/s]
   const uview_1d<Real>& ntsnprd, // net snow production in layer            [kg/kg/s]
   const uview_1d<Real>& flxprec, // Convective flux of prec at interfaces   [kg/m2/s]
-  const uview_1d<Real>& flxsnow) // Convective flux of snow at interfaces   [kg/m2/s])
+  const uview_1d<Real>& flxsnow, // Convective flux of snow at interfaces   [kg/m2/s])
+  const uview_1d<const Real>& prdsnow_plume) // plume ice converted to precip [kg/kg/s] (optional)
 {
+  // With use_plume_freezing the latent heat of fusion of the precipitation that
+  // was frozen in the updraft plume has already been applied by zm_conv_main, so
+  // it is removed from the snow production heating here. The snow fraction of
+  // the precipitation itself is unchanged, any difference between it and the
+  // plume ice is frozen (or melted) at production.
+  const bool use_plume_snow = runtime_opt.use_plume_freezing && prdsnow_plume.extent_int(0) > 0;
+
   // perturbation constant used in pergro snow fraction guard
 
 #ifdef PERGRO
@@ -178,6 +186,7 @@ void Functions<S,D>::zm_conv_evap(
         if (snowmlt > 0) work2 = 0;
         ntsnprd(k) = prdprec(k) * work2 - evpsnow - snowmlt;
         tend_s_snwprd  (k) = prdprec(k) * work2 * PC::LatIce.value;
+        if (use_plume_snow) tend_s_snwprd(k) -= prdsnow_plume(k) * PC::LatIce.value;
         tend_s_snwevmlt(k) = -(evpsnow + snowmlt) * PC::LatIce.value;
       } else {
         ntsnprd(k) = prdsnow_k - Kokkos::min(flxsnow(k) * PC::gravit.value / p_del(k), evpsnow + snowmlt);
@@ -195,6 +204,7 @@ void Functions<S,D>::zm_conv_evap(
       // heating and moistening due to evaporation
       if (runtime_opt.old_snow) {
         tend_s(k) = -evpprec * PC::LatVap.value + ntsnprd(k) * PC::LatIce.value;
+        if (use_plume_snow) tend_s(k) -= prdsnow_plume(k) * PC::LatIce.value;
       } else {
         tend_s(k) = -evpprec * PC::LatVap.value + tend_s_snwevmlt(k);
       }

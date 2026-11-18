@@ -41,6 +41,34 @@ void zm_finalize_cxx()
   ZMF::zm_finalize();
 }
 
+// Copy an optional [n0,n1] C-layout host array to a new device view
+// (zero vertical extent when n1 is zero)
+view2dr_d plume_frz_to_device(const std::vector<Real>& h, const Int n0, const Int n1, const std::string& name)
+{
+  view2dr_d v(name, n0, n1);
+  if (n1 > 0 && !h.empty()) {
+    EKAT_REQUIRE_MSG(static_cast<Int>(h.size()) == n0*n1, "Error! plume_frz_to_device: size mismatch for " << name);
+    auto v_h = Kokkos::create_mirror_view(v);
+    for (Int i = 0; i < n0; ++i) {
+      for (Int k = 0; k < n1; ++k) v_h(i,k) = h[i*n1 + k];
+    }
+    Kokkos::deep_copy(v, v_h);
+  }
+  return v;
+}
+
+// Copy a device view to a C-layout host array
+void plume_frz_to_host(const view2dr_d& v, std::vector<Real>& h)
+{
+  const Int n0 = v.extent(0), n1 = v.extent(1);
+  auto v_h = Kokkos::create_mirror_view(v);
+  Kokkos::deep_copy(v_h, v);
+  h.assign(n0*n1, 0);
+  for (Int i = 0; i < n0; ++i) {
+    for (Int k = 0; k < n1; ++k) h[i*n1 + k] = v_h(i,k);
+  }
+}
+
 }
 
 void ientropy(IentropyData& d)
@@ -1005,7 +1033,17 @@ std::vector<bool> zm_conv_main(ZmConvMainData& d)
 
 void zm_conv_evap(ZmConvEvapData& d)
 {
+  zm_conv_evap(d, nullptr);
+}
+
+void zm_conv_evap(ZmConvEvapData& d, const ZmPlumeFrzData* f)
+{
   zm_opts_init();
+
+  // optional plume freezing input
+  const bool use_frz = f != nullptr && f->use_plume_freezing;
+  const auto prdsnow_plume_d = plume_frz_to_device(use_frz ? f->sprd : std::vector<Real>(),
+                                                   d.pcols, use_frz ? d.pver : 0, "prdsnow_plume");
 
   // create device views and copy
   std::vector<view1dr_d> vec1dr_in(2);
@@ -1044,6 +1082,7 @@ void zm_conv_evap(ZmConvEvapData& d)
   const Int pverp = d.pverp;
 
   ZMF::ZmRuntimeOpt init_cp = ZMF::s_zm_opts;
+  init_cp.use_plume_freezing = use_frz;
 
   Kokkos::parallel_for(policy, KOKKOS_LAMBDA(const MemberType& team) {
     const Int i = team.league_rank();
@@ -1086,7 +1125,8 @@ void zm_conv_evap(ZmConvEvapData& d)
       ntprprd_c,
       ntsnprd_c,
       flxprec_c,
-      flxsnow_c);
+      flxsnow_c,
+      ekat::subview(prdsnow_plume_d, i));
   });
 
   // Now get arrays
@@ -1315,7 +1355,17 @@ void zm_downdraft_properties(ZmDowndraftPropertiesData& d)
 
 void zm_cloud_properties(ZmCloudPropertiesData& d)
 {
+  zm_cloud_properties(d, nullptr);
+}
+
+void zm_cloud_properties(ZmCloudPropertiesData& d, ZmPlumeFrzData* f)
+{
   zm_opts_init();
+
+  // optional plume freezing outputs
+  const bool use_frz = f != nullptr && f->use_plume_freezing;
+  const Int pver_frz = use_frz ? d.pver : 0;
+  view2dr_d frz_d("frz", d.pcols, pver_frz), qi_d("qi", d.pcols, pver_frz), sprd_d("sprd", d.pcols, pver_frz);
 
   // create device views and copy
   std::vector<view1dr_d> vec1dr_in(2);
@@ -1368,6 +1418,7 @@ void zm_cloud_properties(ZmCloudPropertiesData& d)
 
   const auto policy = ekat::TeamPolicyFactory<ExeSpace>::get_default_team_policy(d.pcols, d.pver);
   ZMF::ZmRuntimeOpt init_cp = ZMF::s_zm_opts;
+  init_cp.use_plume_freezing = use_frz;
   WSM wsm(d.pverp, 20, policy);
 
   // unpack data scalars because we do not want the lambda to capture d
@@ -1404,6 +1455,17 @@ void zm_cloud_properties(ZmCloudPropertiesData& d)
     const auto evp_c = ekat::subview(evp_d, i);
     const auto pflx_c = ekat::subview(pflx_d, i);
     const auto rprd_c = ekat::subview(rprd_d, i);
+
+    if (use_frz) {
+      ZMF::zm_cloud_properties(team, wsm.get_workspace(team), init_cp, pver, pverp, msg, limcnv,
+        p_mid_c, z_mid_c, z_int_c, t_mid_c, s_mid_c, s_int_c, q_mid_c,
+        landfrac_d(i), tpert_g_d(i), jb_d(i), lel_d(i),
+        cldtop_klev_d(i), jlcl_d(i), j0_d(i), jd_d(i),
+        mflx_up_c, entr_up_c, detr_up_c, mflx_dn_c, entr_dn_c, mflx_net_c,
+        s_upd_c, q_upd_c, ql_c, s_dnd_c, q_dnd_c, qst_c, cu_c, evp_c, pflx_c, rprd_c,
+        ekat::subview(frz_d, i), ekat::subview(qi_d, i), ekat::subview(sprd_d, i));
+      return;
+    }
 
     ZMF::zm_cloud_properties(
       team,
@@ -1454,6 +1516,12 @@ void zm_cloud_properties(ZmCloudPropertiesData& d)
 
   std::vector<view1di_d> vec1di_out = {j0_d, jd_d, jlcl_d, cldtop_klev_d};
   ekat::device_to_host({d.j0, d.jd, d.jlcl, d.cldtop_klev}, d.pcols, vec1di_out);
+
+  if (use_frz) {
+    plume_frz_to_host(frz_d,  f->frz);
+    plume_frz_to_host(qi_d,   f->qi);
+    plume_frz_to_host(sprd_d, f->sprd);
+  }
 
   zm_finalize_cxx();
 }
@@ -1595,7 +1663,19 @@ void zm_closure(ZmClosureData& d)
 
 void zm_calc_output_tend(ZmCalcOutputTendData& d)
 {
+  zm_calc_output_tend(d, nullptr);
+}
+
+void zm_calc_output_tend(ZmCalcOutputTendData& d, ZmPlumeFrzData* f)
+{
   zm_opts_init();
+
+  // optional plume freezing inputs and output
+  const bool use_frz = f != nullptr && f->use_plume_freezing;
+  const Int pver_frz = use_frz ? d.pver : 0;
+  const auto frz_d = plume_frz_to_device(use_frz ? f->frz : std::vector<Real>(), d.pcols, pver_frz, "frz");
+  const auto qi_d  = plume_frz_to_device(use_frz ? f->qi  : std::vector<Real>(), d.pcols, pver_frz, "qi");
+  view2dr_d di_d("di", d.pcols, pver_frz);
 
   // create device views and copy
   std::vector<view1dr_d> vec1dr_in(1);
@@ -1700,12 +1780,17 @@ void zm_calc_output_tend(ZmCalcOutputTendData& d)
       cu_c,
       dsdt_c,
       dqdt_c,
-      dl_c);
+      dl_c,
+      ekat::subview(frz_d, i),
+      ekat::subview(qi_d, i),
+      ekat::subview(di_d, i));
   });
 
   // Now get arrays
   std::vector<view2dr_d> vec2dr_out = {dl_d, dqdt_d, dsdt_d};
   ekat::device_to_host({d.dl, d.dqdt, d.dsdt}, d.pcols, d.pver, vec2dr_out);
+
+  if (use_frz) plume_frz_to_host(di_d, f->di);
 
   zm_finalize_cxx();
 }

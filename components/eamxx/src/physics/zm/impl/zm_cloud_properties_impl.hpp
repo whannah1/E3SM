@@ -53,7 +53,10 @@ void Functions<S,D>::zm_cloud_properties(
   const uview_1d<Real>& cu, // condensation rate
   const uview_1d<Real>& evp, // evaporation rate
   const uview_1d<Real>& pflx, // precipitation flux thru layer (pverp-sized)
-  const uview_1d<Real>& rprd) // rate of production of precip at that layer
+  const uview_1d<Real>& rprd, // rate of production of precip at that layer
+  const uview_1d<Real>& frz, // freezing rate of plume condensate (use_plume_freezing only)
+  const uview_1d<Real>& qi, // plume ice condensate, part of ql (use_plume_freezing only)
+  const uview_1d<Real>& sprd) // plume ice converted to precip (use_plume_freezing only)
 {
   // Physics constants (local aliases for readability)
   const Real latvap = PC::LatVap.value;
@@ -61,6 +64,14 @@ void Functions<S,D>::zm_cloud_properties(
   const Real grav   = PC::gravit.value;
   const Real epsilo = PC::ep_2.value;
   const Real rdair  = PC::Rair.value;
+  const Real latice = PC::LatIce.value;
+
+  // Optional plume freezing: the updraft carries the latent heat of fusion of
+  // freezing condensate in its MSE budget (as in EAM with zm_microp). The
+  // freezing rate depends on the condensate, which depends on the updraft MSE,
+  // so the plume calculation is done twice with the freezing lagged by one pass.
+  const bool use_frz = runtime_opt.use_plume_freezing;
+  const Int  itnum   = use_frz ? 2 : 1;
 
   // Minimum updraft mass flux below which the layer is considered inactive
   // If updraft MSE undershoots saturated MSE by more than this, cloud top is 1 level up
@@ -124,6 +135,11 @@ void Functions<S,D>::zm_cloud_properties(
     lambda(k)  = 0;  fice(k)    = 0;
     tug(k)     = 0;  tmp_frz(k) = 0;
     pflxs(k)   = 0;
+
+    // Zero optional plume freezing outputs
+    if (use_frz) {
+      frz(k) = 0;  qi(k) = 0;  sprd(k) = 0;
+    }
   });
   team.team_barrier();
 
@@ -224,221 +240,322 @@ void Functions<S,D>::zm_cloud_properties(
   team.team_barrier();
 
   // =========================================================================
-  // ITERATION (itnum = 1 in Fortran: no outer loop needed)
+  // ITERATION (itnum = 1 unless use_plume_freezing, see itnum in EAM Fortran)
   // =========================================================================
 
-  // 6a. Zero condensation and liquid water arrays (each k independent)
-  Kokkos::parallel_for(Kokkos::TeamVectorRange(team, pver), [&] (const Int& k) {
-    cu(k) = 0;
-    ql(k) = 0;
-  });
-  team.team_barrier();
+  // Freezing rate used in the MSE budget: the plume freezing output when
+  // enabled, otherwise the (always zero) workspace array
+  const auto frz_v = use_frz ? frz : tmp_frz;
 
-  // =========================================================================
-  // 6b. Compute updraft mass flux profile from cloud base upward
-  //     (serial: entr_up(k) depends on mflx_up(k+1) from previous iteration)
-  // =========================================================================
-  Kokkos::single(Kokkos::PerTeam(team), [&] () {
-    if (lambda_max > 0) {
-      // Cloud base: unit mass flux, all entrainment
-      mflx_up(jb) = 1;
-      entr_up(jb) = mflx_up(jb) / dz(jb);
+  // Initial cloud top estimate, restored at the start of each extra iteration
+  const Int cldtop_init = cldtop_klev;
 
-      // Integrate upward using the fractional entrainment lambda profile
-      for (Int k = pver - 1; k >= msg; --k) {
-        if (k >= cldtop_klev && k < jb) {
-          // Height above cloud base interface
-          const Real zuef = z_int(k) - z_int(jb);
-          // Mass flux at top of layer (interface between k and k+1)
-          const Real rmue  = (1/lambda_max) * (std::exp(lambda(k+1)*zuef) - 1) / zuef;
-          // Mass flux at bottom of layer
-          mflx_up(k) = (1/lambda_max) * (std::exp(lambda(k)*zuef) - 1) / zuef;
-          entr_up(k) = (rmue - mflx_up(k+1)) / dz(k);
-          detr_up(k) = (rmue - mflx_up(k))   / dz(k);
+  for (Int iter = 0; iter < itnum; ++iter) {
+
+    // 6-. Restore the plume state modified by the previous pass (iter > 0 only).
+    //     frz_v is kept, it carries the freezing from the previous pass.
+    if (iter > 0) {
+      Kokkos::single(Kokkos::PerTeam(team), [&] () {
+        cldtop_klev = cldtop_init;
+        jlcl        = lel;
+      });
+      team.team_barrier();
+      Kokkos::parallel_for(Kokkos::TeamVectorRange(team, pver), [&] (const Int& k) {
+        mflx_up(k) = 0;  entr_up(k) = 0;  detr_up(k) = 0;
+        h_upd(k)   = h_env(k);
+        s_upd(k)   = s_mid(k);
+        q_upd(k)   = q_mid(k);
+        // same as step 4
+        if (k >= msg && k >= cldtop_init && k <= jb) {
+          if (runtime_opt.tpert_fix) {
+            h_upd(k) = h_env(jb) + cpair * runtime_opt.tiedke_add;
+            s_upd(k) = s_mid(jb) + runtime_opt.tiedke_add;
+          } else {
+            h_upd(k) = h_env(jb) + cpair * (runtime_opt.tiedke_add + runtime_opt.tpert_fac * tpert_g);
+            s_upd(k) = s_mid(jb) + runtime_opt.tiedke_add + runtime_opt.tpert_fac * tpert_g;
+          }
+        }
+      });
+      team.team_barrier();
+    }
+
+    // 6a. Zero condensation and liquid water arrays (each k independent)
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, pver), [&] (const Int& k) {
+      cu(k) = 0;
+      ql(k) = 0;
+      if (use_frz) {
+        qi(k)   = 0;
+        sprd(k) = 0;
+      }
+    });
+    team.team_barrier();
+
+    // =========================================================================
+    // 6b. Compute updraft mass flux profile from cloud base upward
+    //     (serial: entr_up(k) depends on mflx_up(k+1) from previous iteration)
+    // =========================================================================
+    Kokkos::single(Kokkos::PerTeam(team), [&] () {
+      if (lambda_max > 0) {
+        // Cloud base: unit mass flux, all entrainment
+        mflx_up(jb) = 1;
+        entr_up(jb) = mflx_up(jb) / dz(jb);
+
+        // Integrate upward using the fractional entrainment lambda profile
+        for (Int k = pver - 1; k >= msg; --k) {
+          if (k >= cldtop_klev && k < jb) {
+            // Height above cloud base interface
+            const Real zuef = z_int(k) - z_int(jb);
+            // Mass flux at top of layer (interface between k and k+1)
+            const Real rmue  = (1/lambda_max) * (std::exp(lambda(k+1)*zuef) - 1) / zuef;
+            // Mass flux at bottom of layer
+            mflx_up(k) = (1/lambda_max) * (std::exp(lambda(k)*zuef) - 1) / zuef;
+            entr_up(k) = (rmue - mflx_up(k+1)) / dz(k);
+            detr_up(k) = (rmue - mflx_up(k))   / dz(k);
+          }
         }
       }
-    }
-  });
-  team.team_barrier();
+    });
+    team.team_barrier();
 
-  // =========================================================================
-  // 6c. Update updraft MSE profile from cloud base upward
-  //     (serial: h_upd(k) depends on h_upd(k+1) from previous iteration)
-  // =========================================================================
-  khighest = lel;
-  klowest  = jb;
-  Kokkos::single(Kokkos::PerTeam(team), [&] () {
-    for (Int k = klowest - 1; k >= khighest; --k) {
-      if (k <= jb - 1 && k >= lel && lambda_max > 0) {
-        if (mflx_up(k) < ZMC::mu_min) {
-          // Below threshold: detrain all upward flux, reset to environment
-          h_upd(k)   = h_env(k);
+    // =========================================================================
+    // 6c. Update updraft MSE profile from cloud base upward
+    //     (serial: h_upd(k) depends on h_upd(k+1) from previous iteration)
+    // =========================================================================
+    khighest = lel;
+    klowest  = jb;
+    Kokkos::single(Kokkos::PerTeam(team), [&] () {
+      for (Int k = klowest - 1; k >= khighest; --k) {
+        if (k <= jb - 1 && k >= lel && lambda_max > 0) {
+          if (mflx_up(k) < ZMC::mu_min) {
+            // Below threshold: detrain all upward flux, reset to environment
+            h_upd(k)   = h_env(k);
+            mflx_up(k) = 0;
+            entr_up(k) = 0;
+            detr_up(k) = mflx_up(k+1) / dz(k);
+          } else if (use_frz) {
+            // MSE budget with the latent heat of fusion of condensate frozen in
+            // the previous pass (same detrainment form as the default budget)
+            h_upd(k) = mflx_up(k+1)/mflx_up(k) * h_upd(k+1)
+                     + dz(k)/mflx_up(k) * (entr_up(k)*h_env(k) - detr_up(k)*h_env_sat(k)
+                                           + latice*frz_v(k));
+          } else {
+            // MSE budget: updraft MSE is flux-weighted mix of below and environment
+            h_upd(k) = mflx_up(k+1)/mflx_up(k) * h_upd(k+1)
+                     + dz(k)/mflx_up(k) * (entr_up(k)*h_env(k) - detr_up(k)*h_env_sat(k));
+          }
+        }
+      }
+    });
+    team.team_barrier();
+
+    // =========================================================================
+    // 6d. Accumulate freezing contribution for cloud top determination
+    //     (zero unless use_plume_freezing, where it holds the previous pass)
+    // =========================================================================
+    Kokkos::parallel_reduce(Kokkos::TeamVectorRange(team, pver),
+                             [&] (const Int& k, Real& val) {
+                               val += frz_v(k) * dz(k);
+                             }, tot_frz);
+    team.team_barrier();
+
+    // =========================================================================
+    // 6e. Determine cloud top by comparing updraft and saturated env MSE
+    //     (serial: doit flag creates sequential dependency)
+    // =========================================================================
+    Kokkos::single(Kokkos::PerTeam(team), [&] () {
+      bool doit = true;
+      for (Int k = klowest - 2; k >= khighest - 1; --k) {
+        if (doit && k <= jb - 2 && k >= lel - 1) {
+          if (h_upd(k) <= hsthat(k) && h_upd(k+1) > hsthat(k+1)
+              && mflx_up(k) >= ZMC::mu_min) {
+            // Updraft MSE crosses saturation MSE from above: this is the cloud top
+            if (h_upd(k) - hsthat(k) < ZMC::hu_diff_min) {
+              cldtop_klev = k + 1;  // Large undershoot: cloud top is one level higher
+            } else {
+              cldtop_klev = k;
+            }
+            doit = false;
+          } else if ((h_upd(k) > h_upd(jb) && tot_frz <= 0)
+                     || mflx_up(k) < ZMC::mu_min) {
+            // Neutral or negative buoyancy, or sub-threshold mass flux
+            cldtop_klev   = k + 1;
+            doit = false;
+          }
+        }
+      }
+    });
+    team.team_barrier();
+
+    // =========================================================================
+    // 6f. Zero mass fluxes at and above updated cloud top (each k independent)
+    // =========================================================================
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg, pver), [&] (const Int& k) {
+      if (lambda_max > 0) {
+        // Zero all updraft quantities at and above cloud top
+        if (k >= lel && k <= cldtop_klev) {
           mflx_up(k) = 0;
           entr_up(k) = 0;
+          detr_up(k) = 0;
+          h_upd(k)   = h_env(k);
+        }
+        // At the cloud top level: non-zero detrainment to conserve mass
+        if (k == cldtop_klev) {
           detr_up(k) = mflx_up(k+1) / dz(k);
-        } else {
-          // MSE budget: updraft MSE is flux-weighted mix of below and environment
-          h_upd(k) = mflx_up(k+1)/mflx_up(k) * h_upd(k+1)
-                   + dz(k)/mflx_up(k) * (entr_up(k)*h_env(k) - detr_up(k)*h_env_sat(k));
+          entr_up(k) = 0;
+          mflx_up(k) = 0;
         }
       }
-    }
-  });
-  team.team_barrier();
+    });
+    team.team_barrier();
 
-  // =========================================================================
-  // 6d. Accumulate freezing contribution for cloud top determination
-  //     (tmp_frz currently zero; parallel reduce for future microphysics)
-  // =========================================================================
-  Kokkos::parallel_reduce(Kokkos::TeamVectorRange(team, pver),
-                           [&] (const Int& k, Real& val) {
-                             val += tmp_frz(k) * dz(k);
-                           }, tot_frz);
-  team.team_barrier();
+    // =========================================================================
+    // 6g. LCL determination: compute s_upd, q_upd from cloud base upward and
+    //     find the level where the updraft first reaches saturation
+    //     (serial: done flag and upward mass-balance chain)
+    // =========================================================================
+    Kokkos::single(Kokkos::PerTeam(team), [&] () {
+      bool done = false;
+      for (Int k = pver - 1; k >= msg + 1; --k) {
+        // Initialize s_upd, q_upd at cloud base from h_upd
+        if (k == jb && lambda_max > 0) {
+          q_upd(k) = q_mid(jb);
+          s_upd(k) = (h_upd(k) - latvap * q_upd(k)) / cpair;
+        }
+        // Compute updraft thermodynamics above cloud base up to cloud top
+        if (!done && k > cldtop_klev && k < jb && lambda_max > 0) {
+          s_upd(k) = mflx_up(k+1)/mflx_up(k) * s_upd(k+1)
+                   + dz(k)/mflx_up(k) * (entr_up(k) - detr_up(k)) * s_mid(k);
+          q_upd(k) = mflx_up(k+1)/mflx_up(k) * q_upd(k+1)
+                   + dz(k)/mflx_up(k) * (entr_up(k)*q_mid(k) - detr_up(k)*qst(k));
 
-  // =========================================================================
-  // 6e. Determine cloud top by comparing updraft and saturated env MSE
-  //     (serial: doit flag creates sequential dependency)
-  // =========================================================================
-  Kokkos::single(Kokkos::PerTeam(team), [&] () {
-    bool doit = true;
-    for (Int k = klowest - 2; k >= khighest - 1; --k) {
-      if (doit && k <= jb - 2 && k >= lel - 1) {
-        if (h_upd(k) <= hsthat(k) && h_upd(k+1) > hsthat(k+1)
-            && mflx_up(k) >= ZMC::mu_min) {
-          // Updraft MSE crosses saturation MSE from above: this is the cloud top
-          if (h_upd(k) - hsthat(k) < ZMC::hu_diff_min) {
-            cldtop_klev = k + 1;  // Large undershoot: cloud top is one level higher
-          } else {
-            cldtop_klev = k;
+          // Updraft temperature at the layer interface
+          const Real tu    = s_upd(k) - grav/cpair * z_int(k);
+          // Saturation check at interface pressure (average of adjacent mid-levels)
+          const Real p_ifc = (p_mid(k) + p_mid(k-1)) / 2;
+          Real estu, qstu;
+          qsat_hPa(tu, p_ifc, estu, qstu);
+
+          // LCL is the highest level where updraft is just saturated on ascent
+          if (q_upd(k) >= qstu) {
+            jlcl = k;
+            done = true;  // Fortran equivalent: goto 690
           }
-          doit = false;
-        } else if ((h_upd(k) > h_upd(jb) && tot_frz <= 0)
-                   || mflx_up(k) < ZMC::mu_min) {
-          // Neutral or negative buoyancy, or sub-threshold mass flux
-          cldtop_klev   = k + 1;
-          doit = false;
         }
       }
-    }
-  });
-  team.team_barrier();
+    });
+    team.team_barrier();
 
-  // =========================================================================
-  // 6f. Zero mass fluxes at and above updated cloud top (each k independent)
-  // =========================================================================
-  Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg, pver), [&] (const Int& k) {
-    if (lambda_max > 0) {
-      // Zero all updraft quantities at and above cloud top
-      if (k >= lel && k <= cldtop_klev) {
-        mflx_up(k) = 0;
-        entr_up(k) = 0;
-        detr_up(k) = 0;
-        h_upd(k)   = h_env(k);
+    // =========================================================================
+    // 6h. Above LCL: compute s_upd/q_upd from MSE and interface saturation
+    //     (each k independent given cldtop_klev and jlcl are known)
+    // =========================================================================
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg + 1, pver), [&] (const Int& k) {
+      if (k > cldtop_klev && k <= jlcl && lambda_max > 0) {
+        // Saturated updraft: s and q follow from MSE and saturation constraint
+        s_upd(k) = s_int(k)  + (h_upd(k) - hsthat(k)) / (cpair  * (1 + gamhat(k)));
+        q_upd(k) = qsthat(k) + gamhat(k) * (h_upd(k) - hsthat(k)) / (latvap * (1 + gamhat(k)));
       }
-      // At the cloud top level: non-zero detrainment to conserve mass
-      if (k == cldtop_klev) {
-        detr_up(k) = mflx_up(k+1) / dz(k);
-        entr_up(k) = 0;
-        mflx_up(k) = 0;
+    });
+    team.team_barrier();
+
+    // =========================================================================
+    // 6i. Condensation rate from DSE budget (each k independent given mflx_up)
+    // =========================================================================
+    Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg + 1, pver), [&] (const Int& k) {
+      if (lambda_max > 0 && k >= cldtop_klev && k < jb) {
+        // Condensation = latent heat release implied by DSE flux divergence
+        cu(k) = ((mflx_up(k)*s_upd(k) - mflx_up(k+1)*s_upd(k+1))/dz(k)
+                 - (entr_up(k) - detr_up(k))*s_mid(k))
+                / (latvap/cpair);
+        if (k == cldtop_klev) cu(k) = 0;                           // No condensation at cloud top
+        cu(k) = Kokkos::max(Real(0), cu(k));           // Condensation must be non-negative
       }
-    }
-  });
-  team.team_barrier();
+    });
+    team.team_barrier();
 
-  // =========================================================================
-  // 6g. LCL determination: compute s_upd, q_upd from cloud base upward and
-  //     find the level where the updraft first reaches saturation
-  //     (serial: done flag and upward mass-balance chain)
-  // =========================================================================
-  Kokkos::single(Kokkos::PerTeam(team), [&] () {
-    bool done = false;
-    for (Int k = pver - 1; k >= msg + 1; --k) {
-      // Initialize s_upd, q_upd at cloud base from h_upd
-      if (k == jb && lambda_max > 0) {
-        q_upd(k) = q_mid(jb);
-        s_upd(k) = (h_upd(k) - latvap * q_upd(k)) / cpair;
-      }
-      // Compute updraft thermodynamics above cloud base up to cloud top
-      if (!done && k > cldtop_klev && k < jb && lambda_max > 0) {
-        s_upd(k) = mflx_up(k+1)/mflx_up(k) * s_upd(k+1)
-                 + dz(k)/mflx_up(k) * (entr_up(k) - detr_up(k)) * s_mid(k);
-        q_upd(k) = mflx_up(k+1)/mflx_up(k) * q_upd(k+1)
-                 + dz(k)/mflx_up(k) * (entr_up(k)*q_mid(k) - detr_up(k)*qst(k));
-
-        // Updraft temperature at the layer interface
-        const Real tu    = s_upd(k) - grav/cpair * z_int(k);
-        // Saturation check at interface pressure (average of adjacent mid-levels)
-        const Real p_ifc = (p_mid(k) + p_mid(k-1)) / 2;
-        Real estu, qstu;
-        qsat_hPa(tu, p_ifc, estu, qstu);
-
-        // LCL is the highest level where updraft is just saturated on ascent
-        if (q_upd(k) >= qstu) {
-          jlcl = k;
-          done = true;  // Fortran equivalent: goto 690
+    // =========================================================================
+    // 6j. Liquid water budget, rain production, total precipitation
+    //     (serial: ql(k) depends on ql(k+1) from level below)
+    // =========================================================================
+    if (use_frz) {
+      // ---------------------------------------------------------------------------------------------
+      // Plume freezing: split the latent heating implied by the DSE budget (cu from 6i)
+      // into condensation and freezing, so that the ice fraction of the condensate at
+      // the top of layer k reaches calc_plume_ice_frac(updraft T), without melting.
+      // With C = cu from 6i, the condensation is cu = C - (Lf/Lv)*frz and
+      //   ice_in + dz*frz = f_ice*(cond_in + dz*cu)
+      // is solved for frz. The ice budget mirrors the liquid budget, so qi <= ql.
+      const Real lat_ratio = latice / latvap;
+      Kokkos::single(Kokkos::PerTeam(team), [&] (Real& val) {
+        Real return_val = 0;
+        for (Int k = pver - 1; k >= msg + 1; --k) {
+          rprd(k)  = 0;
+          sprd(k)  = 0;
+          frz_v(k) = 0;
+          if (k >= cldtop_klev && k < jb && lambda_max > 0 && mflx_up(k) >= 0) {
+            // condensate entering from below, net of detrainment
+            const Real mflx_in = mflx_up(k+1) - dz(k)*detr_up(k);
+            const Real cond_in = mflx_in * ql(k+1);
+            const Real ice_in  = mflx_in * qi(k+1);
+            // total latent heating in the layer, in units of condensation
+            const Real lat_tot = cu(k);
+            if (mflx_up(k) > 0) {
+              // updraft temperature at the top interface of layer k
+              const Real t_upd  = s_upd(k) - grav/cpair * z_int(k);
+              const Real f_ice  = ZmRuntimeOpt::calc_plume_ice_frac(t_upd);
+              Real frz_k = Kokkos::max(Real(0), f_ice*(cond_in + dz(k)*lat_tot) - ice_in)
+                           / (dz(k) * (1 + f_ice*lat_ratio));
+              // fusion heating can not exceed the total latent heating (cu >= 0)
+              frz_k = Kokkos::min(frz_k, lat_tot / lat_ratio);
+              frz_v(k) = frz_k;
+              cu(k)    = lat_tot - lat_ratio*frz_k;
+              // liquid + ice and ice mass budgets with autoconversion sink
+              const Real ql1 = (cond_in + dz(k)*cu(k)) / mflx_up(k);
+              const Real qi1 = (ice_in  + dz(k)*frz_k) / mflx_up(k);
+              ql(k) = ql1 / (1 + dz(k)*c0mask);
+              qi(k) = qi1 / (1 + dz(k)*c0mask);
+            } else {
+              ql(k) = 0;
+              qi(k) = 0;
+            }
+            // Net column precipitation = condensation minus detrained condensate
+            return_val += dz(k) * (cu(k) - detr_up(k)*ql(k+1));
+            // Rain production rate by autoconversion, and its ice part
+            rprd(k) = c0mask * mflx_up(k) * ql(k);
+            sprd(k) = c0mask * mflx_up(k) * qi(k);
+          }
         }
-      }
-    }
-  });
-  team.team_barrier();
-
-  // =========================================================================
-  // 6h. Above LCL: compute s_upd/q_upd from MSE and interface saturation
-  //     (each k independent given cldtop_klev and jlcl are known)
-  // =========================================================================
-  Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg + 1, pver), [&] (const Int& k) {
-    if (k > cldtop_klev && k <= jlcl && lambda_max > 0) {
-      // Saturated updraft: s and q follow from MSE and saturation constraint
-      s_upd(k) = s_int(k)  + (h_upd(k) - hsthat(k)) / (cpair  * (1 + gamhat(k)));
-      q_upd(k) = qsthat(k) + gamhat(k) * (h_upd(k) - hsthat(k)) / (latvap * (1 + gamhat(k)));
-    }
-  });
-  team.team_barrier();
-
-  // =========================================================================
-  // 6i. Condensation rate from DSE budget (each k independent given mflx_up)
-  // =========================================================================
-  Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg + 1, pver), [&] (const Int& k) {
-    if (lambda_max > 0 && k >= cldtop_klev && k < jb) {
-      // Condensation = latent heat release implied by DSE flux divergence
-      cu(k) = ((mflx_up(k)*s_upd(k) - mflx_up(k+1)*s_upd(k+1))/dz(k)
-               - (entr_up(k) - detr_up(k))*s_mid(k))
-              / (latvap/cpair);
-      if (k == cldtop_klev) cu(k) = 0;                           // No condensation at cloud top
-      cu(k) = Kokkos::max(Real(0), cu(k));           // Condensation must be non-negative
-    }
-  });
-  team.team_barrier();
-
-  // =========================================================================
-  // 6j. Liquid water budget, rain production, total precipitation
-  //     (serial: ql(k) depends on ql(k+1) from level below)
-  // =========================================================================
-  Kokkos::single(Kokkos::PerTeam(team), [&] (Real& val) {
-    Real return_val = 0;
-    for (Int k = pver - 1; k >= msg + 1; --k) {
-      rprd(k) = 0;
-      if (k >= cldtop_klev && k < jb && lambda_max > 0 && mflx_up(k) >= 0) {
-        if (mflx_up(k) > 0) {
-          // Liquid water mass budget (without autoconversion sink)
-          const Real ql1 = (mflx_up(k+1)*ql(k+1)
-                            - dz(k)*detr_up(k)*ql(k+1)
-                            + dz(k)*cu(k)) / mflx_up(k);
-          // Apply autoconversion sink (c0mask * dz)
-          ql(k) = ql1 / (1 + dz(k)*c0mask);
-        } else {
-          ql(k) = 0;
+        val = return_val;
+      }, totpcp);
+      team.team_barrier();
+    } else {
+      Kokkos::single(Kokkos::PerTeam(team), [&] (Real& val) {
+        Real return_val = 0;
+        for (Int k = pver - 1; k >= msg + 1; --k) {
+          rprd(k) = 0;
+          if (k >= cldtop_klev && k < jb && lambda_max > 0 && mflx_up(k) >= 0) {
+            if (mflx_up(k) > 0) {
+              // Liquid water mass budget (without autoconversion sink)
+              const Real ql1 = (mflx_up(k+1)*ql(k+1)
+                                - dz(k)*detr_up(k)*ql(k+1)
+                                + dz(k)*cu(k)) / mflx_up(k);
+              // Apply autoconversion sink (c0mask * dz)
+              ql(k) = ql1 / (1 + dz(k)*c0mask);
+            } else {
+              ql(k) = 0;
+            }
+            // Net column precipitation = condensation minus detrained liquid
+            return_val += dz(k) * (cu(k) - detr_up(k)*ql(k+1));
+            // Rain production rate by autoconversion
+            rprd(k) = c0mask * mflx_up(k) * ql(k);
+          }
         }
-        // Net column precipitation = condensation minus detrained liquid
-        return_val += dz(k) * (cu(k) - detr_up(k)*ql(k+1));
-        // Rain production rate by autoconversion
-        rprd(k) = c0mask * mflx_up(k) * ql(k);
-      }
-    }
-    val = return_val;
-  }, totpcp);
-  team.team_barrier();
+        val = return_val;
+      }, totpcp);
+      team.team_barrier();
+    } // use_frz
+
+  } // iter
 
   // =========================================================================
   // 7. Downdraft properties

@@ -38,6 +38,7 @@ void Functions<S,D>::zm_opts_init()
   // ZM micro parameters
   s_zm_opts.zm_microp           = false;
   s_zm_opts.old_snow            = true;
+  s_zm_opts.use_plume_freezing  = false;
   // MCSP parameters
   s_zm_opts.mcsp_enabled        = true;
   s_zm_opts.mcsp_t_coeff        = ZMC::MCSP_t_coeff_default;

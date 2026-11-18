@@ -40,14 +40,21 @@ void Functions<S,D>::zm_calc_output_tend(
   // Outputs
   const uview_1d<Real>& dsdt, // output tendency for dry energy
   const uview_1d<Real>& dqdt, // output tendency for specific humidity
-  const uview_1d<Real>& dl) // output tendency for cloud liquid water
+  const uview_1d<Real>& dl, // output tendency for cloud liquid water
+  const uview_1d<const Real>& frz, // plume freezing rate (optional)
+  const uview_1d<const Real>& qi, // plume ice condensate (optional)
+  const uview_1d<Real>& di) // output detrainment of plume ice (optional)
 {
+  // plume freezing terms are only included when the optional views are provided
+  const bool use_frz = frz.extent_int(0) > 0;
+
   //----------------------------------------------------------------------------
   // initialize variables
   Kokkos::parallel_for(Kokkos::TeamVectorRange(team, msg, pver), [&] (const Int& k) {
     dsdt(k) = 0;
     dqdt(k) = 0;
     dl(k)   = 0;
+    if (use_frz) di(k) = 0;
   });
 
   team.team_barrier();
@@ -68,6 +75,13 @@ void Functions<S,D>::zm_calc_output_tend(
               )/p_del(k);
 
     dl(k) = detr_up(k)*ql(k+1);
+
+    if (use_frz) {
+      // latent heat of fusion released by freezing in the plume (see EAM zm_microp)
+      dsdt(k) += PC::LatIce.value/PC::Cpair.value*frz(k);
+      // part of the detrained condensate that is already ice
+      di(k) = detr_up(k)*qi(k+1);
+    }
   });
 
   team.team_barrier();
